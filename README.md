@@ -124,6 +124,12 @@ Expect `CONNECTED: DaVinci Resolve <version>` and your current project/timeline.
 - **"not connected" / test prints NOT CONNECTED** -- the in-Resolve server is not
   running. Re-run step 2. Check `~/.resolve-free-bridge/bridge.log` and
   `~/.resolve-free-bridge/bridge_status.json`.
+- **Stale bridge after a Resolve crash/restart** -- handled automatically. A
+  watchdog shuts the server down when its Resolve handle dies, and a fresh
+  in-Resolve launch reclaims the port from any bridge that is still stale (asking
+  it to quit, or evicting a legacy orphan). So just re-run step 2; you should not
+  need to `kill` anything by hand. If a reclaim ever fails, the log prints the
+  exact `lsof` command to find the squatter.
 - **The menu item errors, or the Py3 console will not start** -- Resolve cannot
   find/use a compatible Python. Install a python.org build it supports, then in
   Resolve pick it under **Fusion -> Fusion Settings -> Script** (or Preferences ->

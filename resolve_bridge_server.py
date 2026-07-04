@@ -28,6 +28,11 @@ scripting API over a tiny localhost-only RPC server so an external process
 It binds 127.0.0.1 only -- nothing leaves the machine. Leave Resolve open; the
 server dies with Resolve. Re-run once per Resolve launch (a single menu click).
 
+Self-healing: a watchdog shuts the server down if its Resolve handle dies, so a
+crashed/relaunched Resolve does not leave a zombie bridge squatting the port.
+And a fresh launch that finds a stale bridge already on the port reclaims it
+(asks it to quit, or evicts a legacy orphan) instead of giving up.
+
 Compatible with the Python that Resolve embeds (3.6+). Pure stdlib.
 """
 
@@ -269,6 +274,20 @@ def _handle(req):
         REG.clear()
         return {"ok": True, "result": {"k": "v", "v": None}}
 
+    if op == "health":
+        # Cheap liveness of the Resolve handle -- lets a client (or a re-launching
+        # instance) tell a working bridge apart from a stale one whose Resolve died.
+        with API_LOCK:
+            alive = _verify(RESOLVE) is not None
+        return {"ok": True, "result": {"k": "v", "v": alive}}
+
+    if op == "shutdown":
+        # Let a client (typically a fresh instance reclaiming the port) ask this
+        # server to stop. Scheduled off-thread so this response still flushes.
+        _log("shutdown requested by client -- stopping bridge.")
+        _schedule_shutdown()
+        return {"ok": True, "result": {"k": "v", "v": "stopping"}}
+
     return {"ok": False, "error": "unknown op %r" % op}
 
 
@@ -313,25 +332,167 @@ class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def _ping_existing():
+def _rpc_once(req, timeout=2.0):
+    """Open a throwaway connection to whatever holds our port, send one request,
+    and return the decoded response dict (or None on any failure)."""
     try:
-        s = socket.create_connection((HOST, PORT), timeout=1.5)
-        payload = json.dumps({"op": "ping"}).encode("utf-8")
-        s.sendall(struct.pack(">I", len(payload)) + payload)
-        hdr = _recvn(s, 4)
-        if not hdr:
+        s = socket.create_connection((HOST, PORT), timeout=timeout)
+        s.settimeout(timeout)
+        try:
+            payload = json.dumps(req).encode("utf-8")
+            s.sendall(struct.pack(">I", len(payload)) + payload)
+            hdr = _recvn(s, 4)
+            if not hdr:
+                return None
+            (ln,) = struct.unpack(">I", hdr)
+            body = _recvn(s, ln)
+            if body is None:
+                return None
+            return json.loads(body.decode("utf-8"))
+        finally:
             s.close()
-            return False
-        (ln,) = struct.unpack(">I", hdr)
-        body = _recvn(s, ln)
-        s.close()
-        return bool(json.loads(body.decode("utf-8")).get("ok"))
     except Exception:
-        return False
+        return None
+
+
+def _probe_existing():
+    """Classify whatever already holds our port:
+        "down"    -- nothing usable answers
+        "healthy" -- one of our bridges, with a LIVE Resolve handle
+        "stale"   -- one of our bridges, but its Resolve handle is dead
+        "foreign" -- answers, but does not speak our protocol
+    """
+    pong = _rpc_once({"op": "ping"})
+    if pong is None:
+        return "down"
+    if not (isinstance(pong, dict) and pong.get("ok")):
+        return "foreign"
+    # It is our bridge. Ask whether its Resolve handle is still alive.
+    h = _rpc_once({"op": "health"})
+    if isinstance(h, dict) and h.get("ok") and isinstance(h.get("result"), dict):
+        return "healthy" if h["result"].get("v") else "stale"
+    # Older bridge with no 'health' op: fall back to a 'root' probe. Server-side
+    # that already tries to refresh a stale handle and fails when Resolve is gone.
+    r = _rpc_once({"op": "root", "name": "Resolve"})
+    if isinstance(r, dict) and r.get("ok"):
+        return "healthy"
+    if isinstance(r, dict):
+        return "stale"
+    return "foreign"
+
+
+def _shutdown_existing():
+    """Ask an existing bridge to stop. True if it accepted the request."""
+    r = _rpc_once({"op": "shutdown"})
+    return bool(isinstance(r, dict) and r.get("ok"))
+
+
+def _squatting_pids():
+    """PIDs LISTENing on our port that are clearly one of OUR bridge processes
+    (their command line runs resolve_bridge_server) -- never the Resolve app
+    itself. POSIX best-effort; returns [] when it cannot tell."""
+    pids = []
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["lsof", "-nP", "-iTCP:%d" % PORT, "-sTCP:LISTEN", "-t"],
+            stderr=subprocess.DEVNULL).decode("utf-8", "replace")
+    except Exception:
+        return pids
+    for tok in out.split():
+        try:
+            pid = int(tok)
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            import subprocess
+            cmd = subprocess.check_output(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                stderr=subprocess.DEVNULL).decode("utf-8", "replace")
+        except Exception:
+            cmd = ""
+        if "resolve_bridge_server" in cmd:
+            pids.append(pid)
+    return pids
+
+
+def _evict_squatter():
+    """Last resort for a legacy orphan that predates the 'shutdown' op: SIGTERM
+    any of OUR bridge processes still holding the port. Guarded to never touch
+    the Resolve app process. True if it signalled at least one."""
+    import signal
+    killed = False
+    for pid in _squatting_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            _log("evicted stale bridge process pid %d (held port %d)." % (pid, PORT))
+            killed = True
+        except Exception as e:
+            _log("could not signal stale bridge pid %d: %s" % (pid, e))
+    return killed
+
+
+def _try_bind(retries=20, delay=0.25):
+    """Bind the server, retrying while a just-evicted predecessor releases the
+    port. Returns the server, or None if the port never frees."""
+    for _ in range(retries):
+        try:
+            return _Server((HOST, PORT), _Handler)
+        except OSError:
+            time.sleep(delay)
+    return None
 
 
 _SERVER = None
 _THREAD = None
+_WATCHDOG = None
+
+
+def _schedule_shutdown(delay=0.2):
+    """Stop the server from OUTSIDE its serving loop, after the current response
+    has a moment to flush. Safe to call from a request-handler thread."""
+    def _stop():
+        time.sleep(delay)
+        srv = _SERVER
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+    threading.Thread(target=_stop, name="resolve-bridge-stop", daemon=True).start()
+
+
+def _watchdog(interval=15.0, max_failures=3):
+    """Self-terminate if Resolve goes away, so a dead bridge never squats the
+    port after Resolve quits or restarts (the bug that used to force a manual
+    kill). Needs several consecutive failures so a momentarily-busy Resolve does
+    not trip it."""
+    global RESOLVE, RESOLVE_SRC
+    fails = 0
+    while True:
+        time.sleep(interval)
+        srv = _SERVER
+        if srv is None:
+            return
+        with API_LOCK:
+            alive = _verify(RESOLVE) is not None
+            if not alive:                      # one refresh attempt before counting
+                RESOLVE, RESOLVE_SRC = _get_resolve()
+                alive = RESOLVE is not None
+        if alive:
+            fails = 0
+            continue
+        fails += 1
+        _log("watchdog: Resolve handle unavailable (%d/%d)." % (fails, max_failures))
+        if fails >= max_failures:
+            _log("watchdog: Resolve is gone -- shutting down bridge to free port %d." % PORT)
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+            return
 
 
 def start(block=True):
@@ -357,18 +518,37 @@ def start(block=True):
     try:
         _SERVER = _Server((HOST, PORT), _Handler)
     except OSError as e:
-        if _ping_existing():
-            _log("bridge already running on %s:%d -- nothing to do." % (HOST, PORT))
+        status = _probe_existing()
+        if status == "healthy":
+            _log("bridge already running (healthy) on %s:%d -- nothing to do." % (HOST, PORT))
             _write_status(True, {"note": "already running", "product": product,
                                  "version": version})
-        else:
-            _log("cannot bind %s:%d (%s) and it is not our bridge." % (HOST, PORT, e))
-            _write_status(False, {"error": "bind failed: %s" % e})
-        return False
+            return False
+        if status == "foreign":
+            _log("cannot bind %s:%d (%s): a non-bridge process holds the port." % (HOST, PORT, e))
+            _write_status(False, {"error": "port held by foreign process: %s" % e})
+            return False
+        # "stale" (dead Resolve handle) or "down" (half-open socket): the old bug
+        # left a zombie bridge here and gave up. Now we reclaim the port instead.
+        _log("existing bridge on %s:%d is %s -- reclaiming the port." % (HOST, PORT, status))
+        if not _shutdown_existing():     # newer bridges stop themselves on request
+            _evict_squatter()            # legacy orphan with no 'shutdown' op
+        _SERVER = _try_bind()
+        if _SERVER is None:
+            _log("could not reclaim port %d from the stale bridge -- kill it by hand "
+                 "(lsof -nP -iTCP:%d -sTCP:LISTEN) and re-run." % (PORT, PORT))
+            _write_status(False, {"error": "reclaim failed on port %d" % PORT})
+            return False
+        _log("reclaimed port %d from the stale bridge." % PORT)
 
     _log("LISTENING on %s:%d  (source=%s). Leave Resolve open." % (HOST, PORT, RESOLVE_SRC))
     _write_status(True, {"product": product, "version": version, "source": RESOLVE_SRC,
                          "listening": True})
+
+    global _WATCHDOG
+    _WATCHDOG = threading.Thread(target=_watchdog, name="resolve-bridge-watchdog",
+                                 daemon=True)
+    _WATCHDOG.start()
 
     if not block:
         # Background mode -- for tests, or a persistent interpreter (Fusion Console)
